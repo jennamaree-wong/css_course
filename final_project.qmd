@@ -1,0 +1,574 @@
+---
+title: "final project"
+format: html
+editor: visual
+---
+
+## Summary
+
+
+```{r}
+install.packages("pdftools")
+install.packages("textdata") 
+install.packages("topicmodels")
+install.packages("reshape2")
+
+library(pdftools)
+library(tidyverse)
+library(cowplot)
+library(tesseract)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(topicmodels)
+library(reshape2)
+```
+
+## Step 1: Read in the PDFs
+
+This analysis uses Letters and Agreements of Postsecondary Disability Discrimination cases in the state of Indiana. Download the PDFs here: <https://ocrcas.ed.gov/ocr-search?f%5B0%5D=it%3APost%20Secondary&f%5B1%5D=ocr_statutes%3A528&f%5B2%5D=state_fullname%3A653>.
+
+Let's read them in using the `pdftools` package and store them in a single data frame.
+
+```{r}
+# Set base path
+base_path <- "/Users/jennamareewong/Library/CloudStorage/Box-Box/Courses/SOC 384J : Computational Social Science/Final Project/Data/"
+
+# Get all PDF files in the directory
+pdf_files <- list.files(base_path, pattern = "\\.pdf$", full.names = TRUE)
+
+# Read all PDFs into a named list
+pdf_texts <- lapply(pdf_files, pdf_text)
+
+# Name each list element by the filename (without path and extension)
+names(pdf_texts) <- tools::file_path_sans_ext(basename(pdf_files))
+```
+
+Create lists of the letters and agreements.
+
+```{r}
+agreements <- pdf_texts[grepl("_Agreement", names(pdf_texts))]
+letters    <- pdf_texts[grepl("_Letter",    names(pdf_texts))]
+```
+
+Create a data frame.
+
+```{r}
+# Create the data frame from pdf_texts
+pdf_df <- map_dfr(names(pdf_texts), function(doc_name) {
+  tibble(
+    document  = doc_name,
+    page      = 1:length(pdf_texts[[doc_name]]),
+    text      = pdf_texts[[doc_name]]
+  )
+})
+
+# Add doc_type column
+pdf_df <- pdf_df |>
+  mutate(doc_type = case_when(
+    grepl("_Agreement", document) ~ "Agreement",
+    grepl("_Letter",    document) ~ "Letter"
+  ))
+```
+
+## Step 2: Tokenization
+
+Converting text into a **tidy** format: one token (word) per row. The `unnest_tokens()` function does this for us.
+
+```{r}
+## tokenize: split text into individual words
+agreements_tokens <- pdf_df %>%
+  filter(doc_type == "Agreement") %>%
+  unnest_tokens(word, text)
+
+letters_tokens <- pdf_df %>%
+  filter(doc_type == "Letter") %>%
+  unnest_tokens(word, text)
+
+## look at the result
+agreements_tokens
+letters_tokens
+```
+
+## Step 3: Remove stop words
+
+Stop words are common words like "the", "and", "is" that don't carry much meaning. The `tidytext` package includes a built-in list of stop words.
+
+```{r}
+## look at the stop words list
+data(stop_words)
+head(stop_words, 10)
+```
+
+We use an `anti_join()` to remove stop words — this keeps only the words that are *not* in the stop words list.
+
+```{r}
+## see top words to help determine stop words
+agreements_tokens %>%
+  count(word, sort = TRUE) %>%
+  head(50)
+
+letters_tokens %>%
+  count(word, sort = TRUE) %>%
+  head(50)
+
+## create custom stop words
+custom_stopwords <- tibble(
+  word = c("department", "education", "office", "university", "office", "ocr", "agreement", "college", "xxxxx", "xxxxxx", "including")
+)
+
+## remove stop words
+agreements_clean <- agreements_tokens %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stopwords, by = "word")
+
+letters_clean <- letters_tokens %>%
+  anti_join(stop_words, by = "word") %>%
+  anti_join(custom_stopwords, by = "word")
+```
+
+## Step 4: Word frequencies
+
+Now let's count the most common words in each set of reviews.
+
+```{r}
+## count words by review set
+ag_word_counts <- agreements_clean %>%
+  count(document, word, sort = TRUE)
+
+let_word_counts <- letters_clean %>%
+  count(document, word, sort = TRUE)
+```
+
+Let's visualize the top 15 words for letters and for agreements:
+
+```{r}
+## plot top 15 words per case
+let_word_counts %>%
+  group_by(document) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, document)) %>%
+  ggplot(aes(x = n, y = word)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  facet_wrap(~document, scales = "free_y") +
+  scale_y_reordered() +
+  theme_cowplot() +
+  labs(x = "Count", y = NULL, title = "Most common words by discrimination case letter")
+
+ag_word_counts %>%
+  group_by(document) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder_within(word, n, document)) %>%
+  ggplot(aes(x = n, y = word)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  facet_wrap(~document, scales = "free_y") +
+  scale_y_reordered() +
+  theme_cowplot() +
+  labs(x = "Count", y = NULL, title = "Most common words by discrimination case agreement")
+```
+
+## Step 5: Dictionary methods
+
+A dictionary method is simple: we define a list of words that belong to a category, and then we count how often those words appear. This is one of the most straightforward approaches to text analysis.
+
+Let's create a custom dictionary to classify reviewer language into categories relevant to peer review.
+
+```{r}
+## define a custom peer review dictionary
+review_dictionary <- tibble(
+  word = c(
+    ## type of disability
+    "visual", "overfitting", "validation", "validate", "bias", "error",
+    "errors", "residuals", "uncertainty", "robust", "robustness",
+    ## positive evaluation
+    "impressive", "excellent", "important", "interesting", "valuable", "strong",
+    "clear", "nice", "enjoyed", "wonderful", "helpful", "strength", "strengths",
+    ## negative evaluation
+    "lacking", "disappointing", "flawed", "problematic", "poor", "poorly",
+    "weak", "missing", "unclear", "insufficient", "outdated", "concern", "concerns",
+    ## suggestions
+    "suggest", "suggestion", "improve", "improvement", "consider",
+    "recommend", "request", "include", "adding", "clarify"
+  ),
+  category = c(
+    rep("Methodology", 11),
+    rep("Positive", 13),
+    rep("Negative", 13),
+    rep("Suggestion", 10)
+  )
+)
+
+review_dictionary
+```
+
+Now let's apply the dictionary by joining it with our tokenized reviews:
+
+```{r}
+## apply dictionary using inner_join
+dictionary_results <- reviews_clean %>%
+  inner_join(review_dictionary, by = "word")
+
+## count by review set and category
+dictionary_summary <- dictionary_results %>%
+  count(review_set, category)
+
+dictionary_summary
+```
+
+```{r}
+## visualize dictionary results
+dictionary_summary %>%
+  ggplot(aes(x = category, y = n, fill = review_set)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  theme_cowplot() +
+  scale_fill_viridis_d() + 
+  labs(x = "Category", y = "Count", fill = "Review Set",
+       title = "Dictionary-based classification of reviewer language") +
+  theme(legend.position = "bottom")
+```
+
+We can also compute the share of dictionary words in each category per review set — this accounts for the fact that some reviews are longer than others.
+
+```{r}
+## compute proportions within each review set
+dictionary_proportions <- dictionary_results %>%
+  count(review_set, category) %>%
+  group_by(review_set) %>%
+  mutate(proportion = n / sum(n)) %>%
+  ungroup()
+
+dictionary_proportions %>%
+  ggplot(aes(x = category, y = proportion, fill = review_set)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  theme_cowplot() +
+    scale_fill_viridis_d() + 
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Category", y = "Share of dictionary words", fill = "Review Set",
+       title = "Proportion of reviewer language by category") +
+  theme(legend.position = "bottom")
+```
+
+```{r}
+data(stop_words)
+
+custom_stopwords <- tibble(
+  word = c("department", "education", "office", "complaint", "recipient", "resolution", "agreement", "university", "office", "ocr")
+)
+
+tidy_corpus <- tidy_corpus %>%
+  anti_join(stop_words, by = "word") %>% 
+  anti_join(custom_stopwords, by = "word")
+```
+
+Count words per document.
+
+```{r}
+word_counts <- tidy_corpus %>%
+  count(file, word, sort = TRUE)
+```
+
+Create document-term matrix.
+
+```{r}
+dtm <- word_counts %>%
+  cast_dtm(document = file, term = word, value = n)
+```
+
+## Step 6: Sentiment analysis
+
+Sentiment analysis uses pre-built dictionaries (lexicons) to classify words as positive or negative. The `tidytext` package gives us access to several sentiment lexicons.
+
+### AFINN lexicon
+
+The AFINN lexicon scores words on a scale from -5 (most negative) to +5 (most positive).
+
+```{r}
+## look at the AFINN lexicon
+afinn <- get_sentiments("afinn")
+head(afinn, 10)
+```
+
+```{r}
+# Join with sentiment scores
+afinn_scores_let <- letters_clean %>%
+  inner_join(afinn, by = "word")
+
+afinn_scores_ag <- agreements_clean %>%
+  inner_join(afinn, by = "word")
+
+# Compute average sentiment by document
+afinn_summary_let <- afinn_scores_let%>%
+  group_by(document) %>%
+  summarize(
+    mean_sentiment = mean(value),
+    sd_sentiment = sd(value),
+    n_words = n(),
+    se = sd_sentiment / sqrt(n_words)
+  )
+
+afinn_summary_ag <- afinn_scores_ag%>%
+  group_by(document) %>%
+  summarize(
+    mean_sentiment = mean(value),
+    sd_sentiment = sd(value),
+    n_words = n(),
+    se = sd_sentiment / sqrt(n_words)
+  )
+
+afinn_summary_let
+afinn_summary_ag
+```
+
+Plot the average sentiments with confidence intervals.
+
+```{r}
+# Letters
+afinn_summary_let %>%
+  ggplot(aes(x = document, y = mean_sentiment,
+             ymin = mean_sentiment - 1.96 * se,
+             ymax = mean_sentiment + 1.96 * se)) +
+  geom_pointrange(shape = 21, fill = "white", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_cowplot() +
+  coord_flip() +
+  labs(x = "Document", y = "Mean AFINN Sentiment Score",
+       title = "Average sentiment by letter")
+
+# Agreements
+afinn_summary_ag %>%
+  ggplot(aes(x = document, y = mean_sentiment,
+             ymin = mean_sentiment - 1.96 * se,
+             ymax = mean_sentiment + 1.96 * se)) +
+  geom_pointrange(shape = 21, fill = "white", size = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_cowplot() +
+  coord_flip() +
+  labs(x = "Document", y = "Mean AFINN Sentiment Score",
+       title = "Average sentiment by agreement")
+
+# Merge into one figure
+afinn_combined <- bind_rows(
+  afinn_summary_let %>% mutate(doc_type = "Letter"),
+  afinn_summary_ag %>% mutate(doc_type = "Agreement")
+) %>%
+  # Extract institution name by removing "_Letter" or "_Agreement" suffix
+  mutate(institution = gsub("_Letter.*|_Agreement.*", "", document))
+
+# Plot the new figure
+afinn_combined %>%
+  ggplot(aes(x = mean_sentiment, y = institution, color = doc_type,
+             xmin = mean_sentiment - 1.96 * se,
+             xmax = mean_sentiment + 1.96 * se)) +
+  geom_pointrange(shape = 21, fill = "white", size = 1,
+                  position = position_dodge(width = 0.5)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  theme_cowplot() +
+  labs(y = "Institution", x = "Mean AFINN Sentiment Score",
+       color = "Document Type",
+       title = "Sentiment by institution: Letters vs Agreements")
+
+```
+
+### Bing lexicon
+
+The Bing lexicon classifies words as simply "positive" or "negative."
+
+```{r}
+## look at bing lexicon
+bing <- get_sentiments("bing")
+head(bing, 10)
+
+bing <- bing %>% filter(!word %in% c("inequality", "inequalities"))
+```
+
+```{r}
+
+# --- LETTERS ---
+
+letters_clean <- letters_clean %>%
+  mutate(institution = gsub("_Letter.*", "", document))
+
+agreements_clean <- agreements_clean %>%
+  mutate(institution = gsub("_Agreement.*", "", document))
+
+bing_scores_let <- letters_clean %>%
+  inner_join(bing, by = "word")
+
+bing_summary_let <- bing_scores_let %>%
+  count(institution, sentiment)
+
+bing_summary_let %>%
+  ggplot(aes(x = institution, y = n, fill = sentiment)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("negative" = "darkred", "positive" = "steelblue")) +
+  theme_cowplot() +
+  coord_flip() +
+  labs(x = "Institution", y = "Word Count", fill = "Sentiment",
+       title = "Positive vs. negative words by letter (Bing lexicon)") +
+  theme(legend.position = "bottom")
+
+# --- AGREEMENTS ---
+bing_scores_ag <- agreements_clean %>%
+  inner_join(bing, by = "word")
+
+bing_summary_ag <- bing_scores_ag %>%
+  count(institution, sentiment)
+
+bing_summary_ag %>%
+  ggplot(aes(x = institution, y = n, fill = sentiment)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("negative" = "darkred", "positive" = "steelblue")) +
+  theme_cowplot() +
+  coord_flip() +
+  labs(x = "Institution", y = "Word Count", fill = "Sentiment",
+       title = "Positive vs. negative words by agreement (Bing lexicon)") +
+  theme(legend.position = "bottom")
+
+# --- TOP SENTIMENT WORDS ACROSS ALL DOCUMENTS ---
+bing_scores_all <- bind_rows(bing_scores_let, bing_scores_ag)
+
+bing_scores_all %>%
+  count(word, sentiment, sort = TRUE) %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = n, y = word, fill = sentiment)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  scale_fill_manual(values = c("negative" = "indianred", "positive" = "steelblue")) +
+  theme_cowplot() +
+  labs(x = "Count", y = NULL, title = "Top sentiment words across all documents")
+```
+
+```{r}
+## visualize
+bing_summary %>%
+  ggplot(aes(x = review_set, y = n, fill = sentiment)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  scale_fill_manual(values = c("negative" = "darkred", "positive" = "steelblue")) +
+  theme_cowplot() +
+  labs(x = "Review Set", y = "Word Count", fill = "Sentiment",
+       title = "Positive vs. negative words by review set (Bing lexicon)") + 
+  theme(legend.position = "bottom")
+```
+
+Let's look at which specific words are driving the sentiment:
+
+```{r}
+## top positive and negative words across all reviews
+bing_word_counts <- bing_scores %>%
+  count(word, sentiment, sort = TRUE) %>%
+  group_by(sentiment) %>%
+  slice_max(n, n = 10) %>%
+  ungroup()
+
+bing_word_counts %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(x = n, y = word, fill = sentiment)) +
+  geom_col(show.legend = FALSE, alpha = 0.8) +
+  facet_wrap(~sentiment, scales = "free_y") +
+  scale_fill_manual(values = c("negative" = "indianred", "positive" = "steelblue")) +
+  theme_cowplot() +
+  labs(x = "Count", y = NULL, title = "Top sentiment words across all reviews")
+```
+
+**Understanding check:** Look at the top "negative" words. Are all of them actually negative in the context of peer review? What does this tell us about the limitations of sentiment analysis?
+
+### NRC lexicon
+
+The NRC lexicon classifies words into 8 emotions (anger, anticipation, disgust, fear, joy, sadness, surprise, trust) plus positive/negative.
+
+```{r}
+## get nrc lexicon
+nrc <- get_sentiments("nrc")
+
+## join with tokens
+nrc_scores <- reviews_clean %>%
+  inner_join(nrc, by = "word")
+
+## count emotions by review set (exclude positive/negative)
+nrc_summary <- nrc_scores %>%
+  filter(!sentiment %in% c("positive", "negative")) %>%
+  count(review_set, sentiment)
+
+## visualize
+nrc_summary %>%
+  ggplot(aes(x = sentiment, y = n, fill = review_set)) +
+  geom_col(position = "dodge", alpha = 0.8) +
+  theme_cowplot() +
+  labs(x = "Emotion", y = "Count", fill = "Review Set",
+       title = "NRC emotion classification by review set") +
+  theme(axis.text.x = element_text(angle = -45, vjust = 0.5, hjust = 0),
+        legend.position = "bottom")
+```
+
+## Latent Dirichlet Allocation
+
+Create the data
+```{r}
+dtm_ag <- ag_word_counts %>%
+  cast_dtm(document = document, term = word, value = n)
+
+dtm_let <- let_word_counts %>%
+  cast_dtm(document = document, term = word, value = n)
+
+```
+
+Pull topics from LDA
+```{r}
+lda_model_ag <- LDA(dtm_ag, k = 5, control = list(seed = 1234))
+lda_model_let <- LDA(dtm_let, k = 5, control = list(seed = 1234))
+
+```
+
+Analyze topics
+```{r}
+topics_let <- tidy(lda_model_let, matrix = "beta")
+topics_ag <- tidy(lda_model_ag, matrix = "beta")
+
+doc_topics_let <- tidy(lda_model_let, matrix = "gamma")
+
+dominant_topics_let <- doc_topics_let %>%
+  group_by(document) %>%
+  slice_max(gamma, n = 1)
+
+top_terms_let <- topics_let %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup()
+
+top_terms_let %>%
+  ggplot(aes(x = reorder_within(term, beta, topic), y = beta)) +
+  geom_col() +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+
+top_terms_let
+
+doc_topics_ag <- tidy(lda_model_ag, matrix = "gamma")
+
+dominant_topics_ag <- doc_topics_ag %>%
+  group_by(document) %>%
+  slice_max(gamma, n = 1)
+
+top_terms_ag <- topics_ag %>%
+  group_by(topic) %>%
+  slice_max(beta, n = 10) %>%
+  ungroup()
+
+top_terms_ag %>%
+  ggplot(aes(x = reorder_within(term, beta, topic), y = beta)) +
+  geom_col() +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+
+top_terms_ag
+
+```
+
+
